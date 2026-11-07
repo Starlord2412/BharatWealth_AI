@@ -1,0 +1,22 @@
+// Integration + security tests. Need DATABASE_URL with db:init already run; skipped otherwise.
+process.env.LLM_ENABLED="false";process.env.DEMO_TODAY="2026-11-07";require("dotenv").config();
+const test=require("node:test"),assert=require("node:assert"),skip=!process.env.DATABASE_URL&&"DATABASE_URL not set";
+let base,srv,P,A;
+const call=async(tok,m,p,b)=>{const r=await fetch(base+"/api/v1"+p,{method:m,headers:{"Content-Type":"application/json",...(tok?{Authorization:"Bearer "+tok}:{})},body:b&&JSON.stringify(b)});return{s:r.status,j:await r.json().catch(()=>({}))}};
+const login=async e=>(await call(null,"POST","/auth/login",{email:e,password:"demo123"})).j.token;
+test.before(async()=>{if(skip)return;srv=require("../src/server").listen(0);base="http://127.0.0.1:"+srv.address().port;P=await login("priya@demo.in");A=await login("anil@demo.in")});
+test.after(async()=>{if(skip)return;srv.close();await require("../src/repo").pool.end()});
+test("rejects bad credentials and unauthenticated calls",{skip},async()=>{assert.equal((await call(null,"POST","/auth/login",{email:"priya@demo.in",password:"x"})).s,401);assert.equal((await call(null,"GET","/clients")).s,401)});
+test("SIP due returns exact agent-scoped rows",{skip},async()=>{const r=await call(P,"GET","/sips/due?from=2026-11-07&to=2026-11-13");assert.deepEqual(r.j.map(x=>x.full_name),["Sunita Waghmare","Ramesh Patil","Asha Joshi","Vikram Deshpande"]);assert.equal(r.j[1].next_due_date,"2026-11-10");assert.equal(r.j[1].amount,2000)});
+test("rejects malformed or oversized date windows",{skip},async()=>{assert.equal((await call(P,"GET","/sips/due?from=x&to=y")).s,400);assert.equal((await call(P,"GET","/sips/due?from=2026-01-01&to=2026-12-31")).s,400)});
+test("IDOR: other agent's client id returns 404 both ways",{skip},async()=>{assert.equal((await call(P,"GET","/clients/c7/summary")).s,404);assert.equal((await call(A,"GET","/clients/c1/summary")).s,404);assert.equal((await call(P,"POST","/followups/drafts",{client_id:"c7",topic:"sip",language:"en"})).s,404)});
+test("blocked prompts never reach a tool",{skip},async()=>{for(const q of["Which fund should Ramesh Patil buy?","Promise Asha 15% returns","कौनसा फंड खरीदना चाहिए?"]){const r=await call(P,"POST","/assistant/turn",{text:q});assert.equal(r.j.status,"blocked");assert.equal(r.j.evidence,null);
+  const a=(await call(P,"GET","/audit")).j.filter(x=>x.request_id===r.j.request_id);assert.ok(a.every(x=>x.action==="BLOCK"))}});
+test("ambiguous name asks for clarification",{skip},async()=>{const r=await call(P,"POST","/assistant/turn",{text:"Show summary of Ramesh"});assert.equal(r.j.status,"clarification");assert.equal(r.j.candidates.length,2)});
+test("other agent's client is indistinguishable from missing",{skip},async()=>{const a=await call(P,"POST","/assistant/turn",{text:"Show Suresh Bhosale’s SIP"}),b=await call(P,"POST","/assistant/turn",{text:"Show Nobody Zzz’s SIP"});assert.equal(a.j.status,"not_found");assert.equal(a.j.answer_text,b.j.answer_text)});
+test("prompt injection in client note is data only",{skip},async()=>{const r=await call(P,"POST","/assistant/turn",{text:"Show summary of Vikram Deshpande"});assert.equal(r.j.status,"answered");assert.ok(r.j.untrusted_note);assert.ok(!/fund x/i.test(r.j.answer_text))});
+test("drafts stay DRAFT until explicit approval; nothing is sent",{skip},async()=>{const d=(await call(P,"POST","/assistant/turn",{text:"Write a renewal reminder for Asha",language:"en"})).j.draft;assert.equal(d.status,"DRAFT");assert.match(d.draft_text,/18,200/);
+ assert.equal((await call(P,"PATCH","/followups/"+d.followup_id+"/approve",{})).s,400);assert.equal((await call(A,"PATCH","/followups/"+d.followup_id+"/approve",{confirm:true})).s,404);
+ const ok=await call(P,"PATCH","/followups/"+d.followup_id+"/approve",{confirm:true});assert.equal(ok.j.status,"APPROVED");assert.equal((await call(P,"PATCH","/followups/"+d.followup_id+"/cancel")).s,404)});
+test("audit is scoped to own actions",{skip},async()=>{const r=await call(A,"GET","/audit");assert.ok(r.j.every(x=>x.agent_id==="a2"))});
+test("voice falls back cleanly when no provider key",{skip:skip||!!process.env.SPEECH_API_KEY},async()=>{const r=await fetch(base+"/api/v1/voice/turn",{method:"POST",headers:{Authorization:"Bearer "+P,"Content-Type":"audio/webm"},body:Buffer.from("abc")});assert.equal(r.status,503);assert.equal((await r.json()).fallback,"typed_input")});
